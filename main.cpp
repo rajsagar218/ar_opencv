@@ -1,169 +1,265 @@
-#include <iostream>
-#include <opencv2/imgproc.hpp>
-#include "opencv2/highgui/highgui.hpp"
-#include <dlib/opencv.h>
-#include <dlib/image_processing/frontal_face_detector.h>
-#include <dlib/image_processing/render_face_detections.h>
-#include <dlib/image_processing.h>
-#include <opencv/cv.hpp>
+#include <cstdio>
+#include <vector>
 
-const int deviceId = 0;
+// Include GLEW
+#include <GL/glew.h>
 
-static dlib::rectangle openCVRectToDlib(const cv::Rect &r);
-void readCameraParams(cv::Mat&,cv::Mat&,int&,int&);
-void loadFacePoints(std::vector<u_int>&,std::vector<cv::Point3d>&);
+// Include GLFW
+#include <GLFW/glfw3.h>
 
-int main(int argc, const char *argv[]) {
+GLFWwindow *window;
 
-    cv::CascadeClassifier haar_cascade("haarcascade.xml");
+// Include GLM
+#include <glm.hpp>
 
-    // Get a handle to the Video device:
-    cv::VideoCapture cap(deviceId);
-    // Check if we can use this device at all:
-    if (!cap.isOpened()) {
-        std::cerr << "Capture Device ID " << deviceId << "cannot be opened.\n";
+using namespace glm;
+
+#include "common/controls.hpp"
+#include "common/objloader.hpp"
+#include "common/vboindexer.hpp"
+#include "common/shader.hpp"
+#include "common/texture.hpp"
+
+int glfw_init();
+int gl_init();
+void glfw_exit();
+
+// IDs need to free up resources
+GLuint vertexbuffer;
+GLuint normalbuffer;
+GLuint elementbuffer;
+GLuint programID;
+GLuint Texture;
+GLuint VertexArrayID;
+
+int main() {
+
+    if (glfw_init()==-1)
         return -1;
-    }
 
-    // Camera Calibration
-    int width, height;
-    cv::Mat camera_matrix, dist_coeffs, rotation_vector, translation_vector;
-    readCameraParams(camera_matrix, dist_coeffs, width, height);
+    if (gl_init()==-1)
+        return -1;
 
-    // Output from face detection stored here
-    std::vector<cv::Rect_<int>> faces;
-    std::vector<dlib::full_object_detection> shapes;
+    glGenVertexArrays(1, &VertexArrayID);
+    glBindVertexArray(VertexArrayID);
 
-    // Holds the current frame from the Video device:
-    cv::Mat original;
-    cv::Mat gray;
+    // Create and compile our GLSL program from the shaders
+    programID = LoadShaders("StandardShading.vertexshader", "StandardShading.fragmentshader");
 
-    dlib::image_window win;
+    // Get a handle for our "MVP" uniform
+    auto MatrixID = (GLuint) glGetUniformLocation(programID, "MVP");
+    auto ViewMatrixID = (GLuint) glGetUniformLocation(programID, "V");
+    auto ModelMatrixID = (GLuint) glGetUniformLocation(programID, "M");
 
-    // Model for estimating pose
-    dlib::shape_predictor pose_model;
-    dlib::deserialize("shape_predictor_68_face_landmarks.dat") >> pose_model; // FIXME The file's freaking 64MB
+    // Load the texture
+    Texture = loadDDS("uvmap.DDS");
 
-    // Some points out of the 68 Face points
-    std::vector<cv::Point2d> image_points;
+    // Get a handle for our "myTextureSampler" uniform
+    auto TextureID = (GLuint) glGetUniformLocation(programID, "myTextureSampler");
 
-    // Loading face points of interest
+    std::vector<unsigned short> indices;
+    std::vector<glm::vec3> indexed_vertices;
+    std::vector<glm::vec3> indexed_normals;
+    std::vector<glm::vec3> vertices;
+    std::vector<glm::vec3> normals;
 
-    std::vector<u_int> POI; //2D real time coordinates
-    std::vector<cv::Point3d> model_points; // 3D model points
-    loadFacePoints(POI,model_points);
+    // Read our .obj file
+    if (!loadOBJ("skull.obj", vertices, normals))
+        return -2;
 
-    // Project a 3D point (0, 0, 30.0) onto the image plane.
-    // We use this to draw a line sticking out of the nose
+    indexVBO(vertices, normals, indices, indexed_vertices, indexed_normals);
 
-    std::vector<cv::Point3d> nose_points3D;
-    std::vector<cv::Point2d> nose_points2D;
-//    nose_points3D.emplace_back(cv::Point3d(0, 0, 0)); // cartesian 0,0,0
+    // Load it into a VBO
 
-    nose_points3D.emplace_back(cv::Point3d(0, 1.409845, 6.165652)); // nose top
-    nose_points3D.emplace_back(cv::Point3d(0, 0, 30.0));
+    glGenBuffers(1, &vertexbuffer);
+    glBindBuffer(GL_ARRAY_BUFFER, vertexbuffer);
+    glBufferData(GL_ARRAY_BUFFER, indexed_vertices.size() * sizeof(glm::vec3), &indexed_vertices[0], GL_STATIC_DRAW);
+
+    glGenBuffers(1, &normalbuffer);
+    glBindBuffer(GL_ARRAY_BUFFER, normalbuffer);
+    glBufferData(GL_ARRAY_BUFFER, indexed_normals.size() * sizeof(glm::vec3), &indexed_normals[0], GL_STATIC_DRAW);
+
+    // Generate a buffer for the indices as well
+    glGenBuffers(1, &elementbuffer);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, elementbuffer);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned short), &indices[0], GL_STATIC_DRAW);
+
+    // Get a handle for our "LightPosition" uniform
+    glUseProgram(programID);
+    auto LightID = (GLuint) glGetUniformLocation(programID, "LightPosition_worldspace");
+
+    // For speed computation
+    double lastTime = glfwGetTime();
+    int nbFrames = 0;
 
     do {
-        cap >> original;
 
-        // Convert the current frame to grayscale:
-        cvtColor(original, gray, CV_BGR2GRAY);  
+        // Measure speed
+        double currentTime = glfwGetTime();
+        nbFrames++;
+        if (currentTime - lastTime >= 1.0) { // If last prinf() was more than 1sec ago
+            // printf and reset
+            printf("%f ms/frame\n", 1000.0 / double(nbFrames));
+            nbFrames = 0;
+            lastTime += 1.0;
 
-        // Find the faces in the frame:
-        faces.clear();
-        haar_cascade.detectMultiScale(gray, faces, 1.2, 3,
-                                      0 | CV_HAAR_SCALE_IMAGE | CV_HAAR_FIND_BIGGEST_OBJECT,
-                                      cv::Size(65, 65), // FIXME This decides a lot of execution time
-                                      cv::Size(200, 200));
-
-        // Turn OpenCV's Mat into something dlib can deal with.  Don't modify Mat `original` while using cimg.
-        dlib::cv_image<dlib::bgr_pixel> cimg(original);
-
-        // Find the pose of each face.
-        // pose_model provides 68 points on face
-        shapes.clear();
-        for (const cv::Rect_<int> &face : faces)
-            shapes.push_back(pose_model(cimg, openCVRectToDlib(face)));
-
-        if (!shapes.empty()) {
-            // 2D face image points
-
-            image_points.clear();
-
-            for (u_int idx:POI) // TODO Currently estimating pose for only first face
-                image_points.emplace_back(cv::Point2d(shapes.at(0).part(idx).x(), shapes.at(0).part(idx).y()));
-
-            // Solve for pose
-            cv::solvePnP(model_points, image_points, camera_matrix, dist_coeffs, rotation_vector, translation_vector);
-
-            // Core drawing function
-            projectPoints(nose_points3D, rotation_vector, translation_vector, camera_matrix, dist_coeffs,
-                          nose_points2D);
-
-            cv::line(original, nose_points2D[0], nose_points2D[1], cv::Scalar(255, 0, 0), 2);
+            // Print orientation
+            glm::mat4 mat41 = getViewMatrix();
+            printf("%f %f %f %f \n", mat41[0],mat41[1],mat41[2],mat41[3]);
         }
 
-        // Display it all on the screen
-        win.clear_overlay();
-        win.set_image(cimg);
-        win.add_overlay(render_face_detections(shapes));
+        // Clear the screen
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    }while(cv::waitKey(10) != 27);// Exit this loop on escape:
+        // Use our shader
+        glUseProgram(programID);
+
+        // Compute the MVP matrix from keyboard and mouse input
+        computeMatricesFromInputs();
+        glm::mat4 ProjectionMatrix = getProjectionMatrix();
+        glm::mat4 ViewMatrix = getViewMatrix();
+        glm::mat4 ModelMatrix = glm::mat4(1.0);
+        glm::mat4 MVP = ProjectionMatrix * ViewMatrix * ModelMatrix;
+
+        // Send our transformation to the currently bound shader,
+        // in the "MVP" uniform
+        glUniformMatrix4fv(MatrixID, 1, GL_FALSE, &MVP[0][0]);
+        glUniformMatrix4fv(ModelMatrixID, 1, GL_FALSE, &ModelMatrix[0][0]);
+        glUniformMatrix4fv(ViewMatrixID, 1, GL_FALSE, &ViewMatrix[0][0]);
+
+        glm::vec3 lightPos = glm::vec3(4, 4, 4);
+        glUniform3f(LightID, lightPos.x, lightPos.y, lightPos.z);
+
+        // Bind our texture in Texture Unit 0
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, Texture);
+        // Set our "myTextureSampler" sampler to use Texture Unit 0
+        glUniform1i(TextureID, 0);
+
+        // 1rst attribute buffer : vertices
+        glEnableVertexAttribArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, vertexbuffer);
+        glVertexAttribPointer(
+                0,                  // attribute
+                3,                  // size
+                GL_FLOAT,           // type
+                GL_FALSE,           // normalized?
+                0,                  // stride
+                (void *) nullptr            // array buffer offset
+        );
+
+        // 2nd attribute UVs: not present in our case
+        // 3rd attribute buffer : normals
+        glEnableVertexAttribArray(2);
+        glBindBuffer(GL_ARRAY_BUFFER, normalbuffer);
+        glVertexAttribPointer(
+                2,                                // attribute
+                3,                                // size
+                GL_FLOAT,                         // type
+                GL_FALSE,                         // normalized?
+                0,                                // stride
+                (void *) nullptr                          // array buffer offset
+        );
+
+        // Index buffer
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, elementbuffer);
+
+        // Draw the triangles !
+        glDrawElements(
+                GL_TRIANGLES,      // mode
+                indices.size(),    // count
+                GL_UNSIGNED_SHORT,   // type
+                (void *) nullptr           // element array buffer offset
+        );
+
+        glDisableVertexAttribArray(0);
+        glDisableVertexAttribArray(1);
+        glDisableVertexAttribArray(2);
+
+        // Swap buffers
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+
+    } // Check if the ESC key was pressed or the window was closed
+    while (glfwGetKey(window, GLFW_KEY_ESCAPE) != GLFW_PRESS &&
+           glfwWindowShouldClose(window) == 0);
+
+    glfw_exit();
 
     return 0;
 }
 
-inline static dlib::rectangle openCVRectToDlib(const cv::Rect &r) {
-    return {(long) r.tl().x, (long) r.tl().y, (long) r.br().x - 1, (long) r.br().y - 1};
-}
-
-void readCameraParams(cv::Mat& camera_matrix,cv::Mat& dist_coeffs, int& width,int& height){
-    cv::FileStorage fs("calib.yaml", cv::FileStorage::READ);
-    if (!fs.isOpened()){
-        std::cerr<<"Cant open camera calibration file";
-        exit(EXIT_FAILURE);
+int glfw_init(){
+    // Initialise GLFW
+    if (!glfwInit()) {
+        fprintf(stderr, "Failed to initialize GLFW\n");
+        getchar();
+        return -1;
     }
 
-    fs["camera_matrix"] >> camera_matrix;
-    fs["distortion_coefficients"] >> dist_coeffs;
-    fs["image_width"] >> width;
-    fs["image_height"] >> height;
+    glfwWindowHint(GLFW_SAMPLES, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE); // To make MacOS happy; should not be needed
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    // Open a window and create its OpenGL context
+    window = glfwCreateWindow(1024, 768, "Tutorial 09 - VBO Indexing", nullptr, nullptr);
+    if (window == nullptr) {
+        fprintf(stderr,
+                "Failed to open GLFW window. If you have an Intel GPU, they are not 3.3 compatible. Try the 2.1 version of the tutorials.\n");
+        getchar();
+        glfwTerminate();
+        return -1;
+    }
+    glfwMakeContextCurrent(window);
+
+    // Ensure we can capture the escape key being pressed below
+    glfwSetInputMode(window, GLFW_STICKY_KEYS, GL_TRUE);
+    // Hide the mouse and enable unlimited mouvement
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+
+    // Set the mouse at the center of the screen
+    glfwPollEvents();
+    glfwSetCursorPos(window, 1024 / 2, 768 / 2);
+
+    return 0;
 }
 
-void loadFacePoints(std::vector<u_int>& POI,std::vector<cv::Point3d>& model_points){
-    // FIXME I know numbers are wrong(wrt the image) but it works
+int gl_init(){
+    // Initialize GLEW
+    glewExperimental = GL_TRUE; // Needed for core profile
 
-    POI.emplace_back(17); // left brow left corner
-    POI.emplace_back(21); // left brow right corner
-    POI.emplace_back(22); // right brow left corner
-    POI.emplace_back(26); // right brow right corner
-    POI.emplace_back(36); // left eye left corner
-    POI.emplace_back(39); // left eye right corner
-    POI.emplace_back(42); // right eye left corner
-    POI.emplace_back(45); // right eye right corner
-    POI.emplace_back(31); // nose left corner
-    POI.emplace_back(35); // nose right corner
-    POI.emplace_back(48); // mouth left corner
-    POI.emplace_back(54); // mouth right corner
-    POI.emplace_back(57); // mouth central bottom corner
-    POI.emplace_back(8);  // chin corner
+    if (glewInit() != GLEW_OK) {
+        fprintf(stderr, "Failed to initialize GLEW\n");
+        getchar();
+        glfwTerminate();
+        return -1;
+    }
 
-    model_points.emplace_back(cv::Point3d(6.825897, 6.760612, 4.402142));     // left brow left corner
-    model_points.emplace_back(cv::Point3d(1.330353, 7.122144, 6.903745));     // left brow right corner
-    model_points.emplace_back(cv::Point3d(-1.330353, 7.122144, 6.903745));    // right brow left corner
-    model_points.emplace_back(cv::Point3d(-6.825897, 6.760612, 4.402142));    // right brow right corner
-    model_points.emplace_back(cv::Point3d(5.311432, 5.485328, 3.987654));     // left eye left corner
-    model_points.emplace_back(cv::Point3d(1.789930, 5.393625, 4.413414));     // left eye right corner
-    model_points.emplace_back(cv::Point3d(-1.789930, 5.393625, 4.413414));    // right eye left corner
-    model_points.emplace_back(cv::Point3d(-5.311432, 5.485328, 3.987654));    // right eye right corner
-    model_points.emplace_back(cv::Point3d(2.005628, 1.409845, 6.165652));     // nose left corner
-    model_points.emplace_back(cv::Point3d(-2.005628, 1.409845, 6.165652));    // nose right corner
-    model_points.emplace_back(cv::Point3d(2.774015, -2.080775, 5.048531));    // mouth left corner
-    model_points.emplace_back(cv::Point3d(-2.774015, -2.080775, 5.048531));   // mouth right corner
-    model_points.emplace_back(cv::Point3d(0.000000, -3.116408, 6.097667));    // mouth central bottom corner
-    model_points.emplace_back(cv::Point3d(0.000000, -7.415691, 4.070434));    // chin corner
+    // Dark blue background
+    glClearColor(0.0f, 0.0f, 0.4f, 0.0f);
 
-    // Size check
-    if (POI.size() != model_points.size())
-        exit(EXIT_FAILURE);
+    // Enable depth test
+    glEnable(GL_DEPTH_TEST);
+    // Accept fragment if it closer to the camera than the former one
+    glDepthFunc(GL_LESS);
+
+    // Cull triangles which normal is not towards the camera
+    glEnable(GL_CULL_FACE);
+
+    return 0;
+}
+
+void glfw_exit(){
+    // Cleanup VBO and shader
+    glDeleteBuffers(1, &vertexbuffer);
+    glDeleteBuffers(1, &normalbuffer);
+    glDeleteBuffers(1, &elementbuffer);
+    glDeleteProgram(programID);
+    glDeleteTextures(1, &Texture);
+    glDeleteVertexArrays(1, &VertexArrayID);
+
+    // Close OpenGL window and terminate GLFW
+    glfwTerminate();
 }
